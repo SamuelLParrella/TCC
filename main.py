@@ -1,8 +1,3 @@
-"""
-BusPasse API — Backend de autenticação (MariaDB / XAMPP)
-Requisitos: fastapi, uvicorn, mysql-connector-python, bcrypt, python-jose, python-dotenv
-Execute: uvicorn main:app --reload
-"""
 
 import os
 from datetime import datetime, timedelta, timezone
@@ -41,14 +36,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── BANCO DE DADOS ────────────────────────────────────────────────────────────
 def get_conn():
     try:
         return mysql.connector.connect(**DB_CONFIG)
     except mysql.connector.Error as e:
         raise HTTPException(status_code=503, detail=f"Banco de dados indisponível: {e}")
 
-# ── JWT ───────────────────────────────────────────────────────────────────────
 def criar_token(user_id: int, nome: str) -> str:
     payload = {
         "sub": str(user_id),
@@ -66,7 +59,6 @@ def verificar_token(authorization: str = Header(...)) -> dict:
     except (JWTError, ValueError):
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
-# ── SCHEMAS ───────────────────────────────────────────────────────────────────
 class LoginRequest(BaseModel):
     email: str
     senha: str
@@ -84,7 +76,6 @@ class CadastroRequest(BaseModel):
     numero:      str | None = None
     complemento: str | None = None
 
-# ── ROTAS ─────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"status": "ok", "api": "BusPasse API", "versao": "1.0.0"}
@@ -160,7 +151,7 @@ def cadastro(data: CadastroRequest):
                 data.complemento,
             ),
         )
-        user_id = cur.lastrowid   # MariaDB: ID gerado pelo AUTO_INCREMENT
+        user_id = cur.lastrowid   
         conn.commit()
 
         token = criar_token(user_id, data.nome.strip())
