@@ -19,3 +19,18 @@ CREATE TABLE IF NOT EXISTS usuarios (
  
 CREATE INDEX idx_usuarios_email ON usuarios(email);
 CREATE INDEX idx_usuarios_cpf   ON usuarios(cpf);
+
+CREATE TABLE IF NOT EXISTS transacoes (
+    id           INT             AUTO_INCREMENT PRIMARY KEY,
+    usuario_id   INT             NOT NULL,
+    tipo         VARCHAR(10)     NOT NULL,               -- 'credito' | 'debito'
+    valor        DECIMAL(10, 2)  NOT NULL,
+    descricao    VARCHAR(255)    NOT NULL,
+    status       VARCHAR(10)     NOT NULL DEFAULT 'pago', -- 'pendente' | 'pago'
+    pix_txid     VARCHAR(35),
+    criado_em    TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    pago_em      TIMESTAMP       NULL,
+    FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+);
+
+CREATE INDEX idx_transacoes_usuario ON transacoes(usuario_id);
