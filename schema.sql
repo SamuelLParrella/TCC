@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS usuarios (
     tipo_usuario        VARCHAR(20)     NOT NULL DEFAULT 'comum',
     saldo               DECIMAL(10, 2)  NOT NULL DEFAULT 0.00,
     passes_disponiveis  DECIMAL(5, 1)   NOT NULL DEFAULT 0.0,
+    cartao_bloqueado    BOOLEAN         NOT NULL DEFAULT FALSE,
     criado_em           TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
  
