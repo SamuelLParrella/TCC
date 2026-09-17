@@ -1,8 +1,11 @@
 
 import os
+import random
 import re
+import smtplib
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
 
 import bcrypt
 import mysql.connector
@@ -35,6 +38,15 @@ PIX_KEY           = os.getenv("PIX_KEY", "")
 PIX_MERCHANT_NAME = os.getenv("PIX_MERCHANT_NAME", "BUSPASSE LTDA")
 PIX_MERCHANT_CITY = os.getenv("PIX_MERCHANT_CITY", "SAO PAULO")
 PRECO_PASSAGEM    = float(os.getenv("PRECO_PASSAGEM", "5.75"))
+
+# Envio de email para confirmação de cadastro/login (SMTP simples — funciona
+# com Gmail usando uma "senha de app", ou com qualquer outro provedor SMTP).
+SMTP_HOST               = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT               = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER               = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD           = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM               = os.getenv("SMTP_FROM", SMTP_USER)
+CODIGO_VALIDADE_MINUTOS = 15
 
 # Tipos que não pagam tarifa (isenção prevista em lei para idosos e, em regra,
 # pessoas com deficiência no transporte coletivo municipal).
@@ -121,6 +133,33 @@ def cpf_valido(cpf: str) -> bool:
     d2 = digito_verificador(cpf[:9] + d1)
     return cpf[-2:] == d1 + d2
 
+
+# ── EMAIL DE CONFIRMAÇÃO ───────────────────────────────────────────────────────
+def gerar_codigo_verificacao() -> str:
+    """Gera um código numérico de 6 dígitos para confirmar email."""
+    return f"{random.randint(0, 999999):06d}"
+
+def enviar_email(destinatario: str, assunto: str, corpo: str) -> None:
+    """Envia um email simples por SMTP. Se o SMTP não estiver configurado no
+    servidor (variáveis de ambiente ausentes), levanta 503 em vez de falhar
+    silenciosamente — assim fica claro que falta configurar o envio de email."""
+    if not SMTP_USER or not SMTP_PASSWORD:
+        raise HTTPException(status_code=503, detail="Serviço de email não configurado no servidor")
+
+    msg = MIMEText(corpo)
+    msg["Subject"] = assunto
+    msg["From"] = SMTP_FROM
+    msg["To"] = destinatario
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+            smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+    except smtplib.SMTPException as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao enviar email: {e}")
+
+
 def gerar_payload_pix(chave: str, nome: str, cidade: str, valor: float, txid: str) -> str:
     """Monta o Pix Copia e Cola (BR Code) estático para uma chave Pix + valor fixo."""
     nome   = _ascii_upper(nome)[:25] or "BUSPASSE"
@@ -177,6 +216,13 @@ class AtualizarPerfilRequest(BaseModel):
 class TipoUsuarioRequest(BaseModel):
     tipo_usuario: str
 
+class VerificarEmailRequest(BaseModel):
+    email:  str
+    codigo: str
+
+class ReenviarCodigoRequest(BaseModel):
+    email: str
+
 @app.get("/")
 def root():
     return {"status": "ok", "api": "BusPasse API", "versao": "1.0.0"}
@@ -189,7 +235,7 @@ def login(data: LoginRequest):
     cur  = conn.cursor()
     try:
         cur.execute(
-            "SELECT id, nome, senha_hash FROM usuarios WHERE email = %s",
+            "SELECT id, nome, senha_hash, email_verificado FROM usuarios WHERE email = %s",
             (data.email.lower().strip(),),
         )
         row = cur.fetchone()
@@ -197,10 +243,13 @@ def login(data: LoginRequest):
         if not row:
             raise HTTPException(status_code=401, detail="Email ou senha incorretos")
 
-        user_id, nome, senha_hash = row
+        user_id, nome, senha_hash, verificado = row
 
         if not bcrypt.checkpw(data.senha.encode(), senha_hash.encode()):
             raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+
+        if not verificado:
+            raise HTTPException(status_code=403, detail="Confirme seu email antes de entrar. Verifique sua caixa de entrada.")
 
         token = criar_token(user_id, nome)
         return {"token": token, "nome": nome, "id": user_id}
@@ -241,12 +290,15 @@ def cadastro(data: CadastroRequest):
             raise HTTPException(status_code=409, detail="Este CPF já está cadastrado")
 
         senha_hash = bcrypt.hashpw(data.senha.encode(), bcrypt.gensalt()).decode()
+        codigo           = gerar_codigo_verificacao()
+        codigo_expira_em = datetime.utcnow() + timedelta(minutes=CODIGO_VALIDADE_MINUTOS)
 
         cur.execute(
             """
             INSERT INTO usuarios
-                (cpf, nome, email, senha_hash, celular, cep, cidade, bairro, rua, numero, complemento)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (cpf, nome, email, senha_hash, celular, cep, cidade, bairro, rua, numero, complemento,
+                 email_verificado, codigo_verificacao, codigo_expira_em)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s)
             """,
             (
                 cpf_limpo,
@@ -260,13 +312,23 @@ def cadastro(data: CadastroRequest):
                 data.rua,
                 data.numero,
                 data.complemento,
+                codigo,
+                codigo_expira_em,
             ),
         )
-        user_id = cur.lastrowid   
+        user_id = cur.lastrowid
         conn.commit()
 
-        token = criar_token(user_id, data.nome.strip())
-        return {"token": token, "nome": data.nome.strip(), "id": user_id}
+        # A conta já existe nesse ponto — se o envio do email falhar (ex.:
+        # SMTP fora do ar), o usuário pode pedir um novo código depois via
+        # POST /reenviar-codigo, sem precisar recadastrar.
+        enviar_email(
+            email_limpo,
+            "Confirme seu cadastro — BusPasse",
+            f"Seu código de confirmação é {codigo}. Ele expira em {CODIGO_VALIDADE_MINUTOS} minutos.",
+        )
+
+        return {"precisa_verificar": True, "email": email_limpo}
 
     except HTTPException:
         conn.rollback()
@@ -274,6 +336,83 @@ def cadastro(data: CadastroRequest):
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Erro interno: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/verificar-email")
+def verificar_email(data: VerificarEmailRequest):
+    """Confirma o código de 6 dígitos enviado por email e já retorna o JWT (login automático)."""
+    email = data.email.lower().strip()
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id, nome, codigo_verificacao, codigo_expira_em, email_verificado FROM usuarios WHERE email = %s",
+            (email,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+        user_id, nome, codigo_salvo, expira_em, verificado = row
+        if verificado:
+            raise HTTPException(status_code=409, detail="Este email já foi confirmado")
+
+        codigo_expirado = not expira_em or datetime.utcnow() > expira_em
+        if not codigo_salvo or codigo_expirado or data.codigo.strip() != codigo_salvo:
+            raise HTTPException(status_code=422, detail="Código inválido ou expirado")
+
+        cur.execute(
+            "UPDATE usuarios SET email_verificado = TRUE, codigo_verificacao = NULL, codigo_expira_em = NULL WHERE id = %s",
+            (user_id,),
+        )
+        conn.commit()
+
+        token = criar_token(user_id, nome)
+        return {"token": token, "nome": nome, "id": user_id}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/reenviar-codigo")
+def reenviar_codigo(data: ReenviarCodigoRequest):
+    """Gera um novo código de confirmação e reenvia por email (cadastro ainda não confirmado)."""
+    email = data.email.lower().strip()
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT id, email_verificado FROM usuarios WHERE email = %s", (email,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+        user_id, verificado = row
+        if verificado:
+            raise HTTPException(status_code=409, detail="Este email já foi confirmado")
+
+        codigo           = gerar_codigo_verificacao()
+        codigo_expira_em = datetime.utcnow() + timedelta(minutes=CODIGO_VALIDADE_MINUTOS)
+        cur.execute(
+            "UPDATE usuarios SET codigo_verificacao = %s, codigo_expira_em = %s WHERE id = %s",
+            (codigo, codigo_expira_em, user_id),
+        )
+        conn.commit()
+
+        enviar_email(
+            email,
+            "Novo código de confirmação — BusPasse",
+            f"Seu novo código de confirmação é {codigo}. Ele expira em {CODIGO_VALIDADE_MINUTOS} minutos.",
+        )
+        return {"status": "ok"}
+    except HTTPException:
+        conn.rollback()
+        raise
     finally:
         cur.close()
         conn.close()
