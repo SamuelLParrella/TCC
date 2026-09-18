@@ -1,11 +1,12 @@
 
+import json
 import os
 import random
 import re
-import smtplib
 import unicodedata
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
-from email.mime.text import MIMEText
 
 import bcrypt
 import mysql.connector
@@ -39,13 +40,12 @@ PIX_MERCHANT_NAME = os.getenv("PIX_MERCHANT_NAME", "BUSPASSE LTDA")
 PIX_MERCHANT_CITY = os.getenv("PIX_MERCHANT_CITY", "SAO PAULO")
 PRECO_PASSAGEM    = float(os.getenv("PRECO_PASSAGEM", "5.75"))
 
-# Envio de email para confirmação de cadastro/login (SMTP simples — funciona
-# com Gmail usando uma "senha de app", ou com qualquer outro provedor SMTP).
-SMTP_HOST               = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT               = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER               = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD           = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM               = os.getenv("SMTP_FROM", SMTP_USER)
+# Envio de email para confirmação de cadastro/login, via API HTTP da Brevo
+# (https://api.brevo.com/v3/smtp/email) em vez de SMTP — hospedagens
+# gratuitas como o Render costumam bloquear/travar a porta de SMTP (587),
+# mas a API HTTP passa pela porta 443, que nunca é bloqueada.
+BREVO_API_KEY           = os.getenv("BREVO_API_KEY", "")
+BREVO_FROM_EMAIL        = os.getenv("BREVO_FROM_EMAIL", "")
 CODIGO_VALIDADE_MINUTOS = 15
 
 # Tipos que não pagam tarifa (isenção prevista em lei para idosos e, em regra,
@@ -140,24 +140,37 @@ def gerar_codigo_verificacao() -> str:
     return f"{random.randint(0, 999999):06d}"
 
 def enviar_email(destinatario: str, assunto: str, corpo: str) -> None:
-    """Envia um email simples por SMTP. Se o SMTP não estiver configurado no
-    servidor (variáveis de ambiente ausentes), levanta 503 em vez de falhar
-    silenciosamente — assim fica claro que falta configurar o envio de email."""
-    if not SMTP_USER or not SMTP_PASSWORD:
+    """Envia um email transacional via API HTTP da Brevo. Se não estiver
+    configurado no servidor (variáveis de ambiente ausentes), levanta 503 em
+    vez de falhar silenciosamente — assim fica claro que falta configurar."""
+    if not BREVO_API_KEY or not BREVO_FROM_EMAIL:
         raise HTTPException(status_code=503, detail="Serviço de email não configurado no servidor")
 
-    msg = MIMEText(corpo)
-    msg["Subject"] = assunto
-    msg["From"] = SMTP_FROM
-    msg["To"] = destinatario
+    payload = json.dumps({
+        "sender": {"email": BREVO_FROM_EMAIL, "name": "BusPasse"},
+        "to": [{"email": destinatario}],
+        "subject": assunto,
+        "textContent": corpo,
+    }).encode("utf-8")
 
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=payload,
+        method="POST",
+        headers={
+            "accept": "application/json",
+            "api-key": BREVO_API_KEY,
+            "content-type": "application/json",
+        },
+    )
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
-            smtp.starttls()
-            smtp.login(SMTP_USER, SMTP_PASSWORD)
-            smtp.send_message(msg)
-    except smtplib.SMTPException as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao enviar email: {e}")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        detalhe = e.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=502, detail=f"Falha ao enviar email: {detalhe}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=502, detail=f"Falha ao enviar email: {e.reason}")
 
 
 def gerar_payload_pix(chave: str, nome: str, cidade: str, valor: float, txid: str) -> str:
