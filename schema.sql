@@ -15,6 +15,14 @@ CREATE TABLE IF NOT EXISTS usuarios (
     saldo               DECIMAL(10, 2)  NOT NULL DEFAULT 0.00,
     passes_disponiveis  DECIMAL(5, 1)   NOT NULL DEFAULT 0.0,
     cartao_bloqueado    BOOLEAN         NOT NULL DEFAULT FALSE,
+    email_verificado              BOOLEAN      NOT NULL DEFAULT TRUE,
+    codigo_verificacao            VARCHAR(6),
+    codigo_expira_em              DATETIME,
+    admin                         BOOLEAN      NOT NULL DEFAULT FALSE,
+    escola_nome                   VARCHAR(255),
+    escola_email                  VARCHAR(255),
+    verificacao_estudante_status  VARCHAR(20),  
+    verificacao_estudante_token   VARCHAR(64),
     criado_em           TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
  
@@ -24,10 +32,10 @@ CREATE INDEX idx_usuarios_cpf   ON usuarios(cpf);
 CREATE TABLE IF NOT EXISTS transacoes (
     id           INT             AUTO_INCREMENT PRIMARY KEY,
     usuario_id   INT             NOT NULL,
-    tipo         VARCHAR(10)     NOT NULL,               -- 'credito' | 'debito'
+    tipo         VARCHAR(10)     NOT NULL,               
     valor        DECIMAL(10, 2)  NOT NULL,
     descricao    VARCHAR(255)    NOT NULL,
-    status       VARCHAR(10)     NOT NULL DEFAULT 'pago', -- 'pendente' | 'pago'
+    status       VARCHAR(10)     NOT NULL DEFAULT 'pago', 
     pix_txid     VARCHAR(35),
     criado_em    TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
     pago_em      TIMESTAMP       NULL,
