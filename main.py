@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import secrets
 import unicodedata
 import urllib.error
 import urllib.request
@@ -13,12 +14,12 @@ import mysql.connector
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 
 load_dotenv()
 
-# ── CONFIGURAÇÃO ──────────────────────────────────────────────────────────────
 SECRET_KEY        = os.getenv("JWT_SECRET", "troque-isso-por-um-segredo-forte-aleatorio")
 ALGORITHM         = "HS256"
 TOKEN_EXPIRE_DAYS = 7
@@ -31,25 +32,17 @@ DB_CONFIG = {
     "port":     int(os.getenv("DB_PORT", "3306")),
 }
 
-# Chave Pix estática da empresa/beneficiário que recebe as recargas.
-# Sem um PSP (Mercado Pago, Efí, etc.) o backend não recebe webhook de
-# confirmação automática — por isso o app confirma o pagamento manualmente
-# via POST /recarga/{id}/confirmar (ver docstring do endpoint).
 PIX_KEY           = os.getenv("PIX_KEY", "")
 PIX_MERCHANT_NAME = os.getenv("PIX_MERCHANT_NAME", "BUSPASSE LTDA")
 PIX_MERCHANT_CITY = os.getenv("PIX_MERCHANT_CITY", "SAO PAULO")
 PRECO_PASSAGEM    = float(os.getenv("PRECO_PASSAGEM", "5.75"))
 
-# Envio de email para confirmação de cadastro/login, via API HTTP da Brevo
-# (https://api.brevo.com/v3/smtp/email) em vez de SMTP — hospedagens
-# gratuitas como o Render costumam bloquear/travar a porta de SMTP (587),
-# mas a API HTTP passa pela porta 443, que nunca é bloqueada.
 BREVO_API_KEY           = os.getenv("BREVO_API_KEY", "")
 BREVO_FROM_EMAIL        = os.getenv("BREVO_FROM_EMAIL", "")
 CODIGO_VALIDADE_MINUTOS = 15
 
-# Tipos que não pagam tarifa (isenção prevista em lei para idosos e, em regra,
-# pessoas com deficiência no transporte coletivo municipal).
+API_BASE_URL = os.getenv("API_BASE_URL", "https://tcc-82gl.onrender.com")
+
 TIPOS_GRATUITOS = {"idoso", "pcd"}
 
 def tarifa_do_usuario(tipo_usuario: str) -> float:
@@ -61,12 +54,11 @@ def tarifa_do_usuario(tipo_usuario: str) -> float:
         return 0.0
     return PRECO_PASSAGEM
 
-# ── APLICAÇÃO ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="BusPasse API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # Em produção: especifique o domínio do frontend
+    allow_origins=["*"],          
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -95,11 +87,24 @@ def verificar_token(authorization: str = Header(...)) -> dict:
     except (JWTError, ValueError):
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
+def exigir_admin(payload: dict = Depends(verificar_token)) -> dict:
+    """Dependência extra pras rotas /admin/*: confere se o usuário do token tem admin=TRUE."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT admin FROM usuarios WHERE id = %s", (int(payload["sub"]),))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            raise HTTPException(status_code=403, detail="Acesso restrito a administradores")
+        return payload
+    finally:
+        cur.close()
+        conn.close()
+
 class LoginRequest(BaseModel):
     email: str
     senha: str
 
-# ── PIX (BR CODE ESTÁTICO) ────────────────────────────────────────────────────
 def _tlv(id_: str, valor: str) -> str:
     """Codifica um campo no formato TLV (ID + tamanho de 2 dígitos + valor) do EMV/BR Code."""
     return f"{id_}{len(valor):02d}{valor}"
@@ -134,7 +139,6 @@ def cpf_valido(cpf: str) -> bool:
     return cpf[-2:] == d1 + d2
 
 
-# ── EMAIL DE CONFIRMAÇÃO ───────────────────────────────────────────────────────
 def gerar_codigo_verificacao() -> str:
     """Gera um código numérico de 6 dígitos para confirmar email."""
     return f"{random.randint(0, 999999):06d}"
@@ -181,17 +185,17 @@ def gerar_payload_pix(chave: str, nome: str, cidade: str, valor: float, txid: st
 
     conta_pix = _tlv("00", "br.gov.bcb.pix") + _tlv("01", chave)
     payload = (
-        _tlv("00", "01")             # Payload Format Indicator
-        + _tlv("26", conta_pix)      # Merchant Account Information (Pix)
-        + _tlv("52", "0000")         # Merchant Category Code
-        + _tlv("53", "986")          # Moeda: Real (BRL)
-        + _tlv("54", f"{valor:.2f}") # Valor da transação
-        + _tlv("58", "BR")           # País
-        + _tlv("59", nome)           # Nome do beneficiário
-        + _tlv("60", cidade)         # Cidade do beneficiário
-        + _tlv("62", _tlv("05", txid))  # Additional Data Field (txid de referência)
+        _tlv("00", "01")             
+        + _tlv("26", conta_pix)      
+        + _tlv("52", "0000")         
+        + _tlv("53", "986")          
+        + _tlv("54", f"{valor:.2f}") 
+        + _tlv("58", "BR")           
+        + _tlv("59", nome)           
+        + _tlv("60", cidade)         
+        + _tlv("62", _tlv("05", txid))  
     )
-    payload += "6304"  # ID + tamanho do campo CRC16 que vem a seguir
+    payload += "6304"  
     return payload + _crc16_ccitt(payload)
 
 
@@ -332,9 +336,6 @@ def cadastro(data: CadastroRequest):
         user_id = cur.lastrowid
         conn.commit()
 
-        # A conta já existe nesse ponto — se o envio do email falhar (ex.:
-        # SMTP fora do ar), o usuário pode pedir um novo código depois via
-        # POST /reenviar-codigo, sem precisar recadastrar.
         enviar_email(
             email_limpo,
             "Confirme seu cadastro — BusPasse",
@@ -440,7 +441,8 @@ def me(payload: dict = Depends(verificar_token)):
         cur.execute(
             """
             SELECT id, cpf, nome, email, tipo_usuario, saldo, cartao_bloqueado,
-                   celular, cep, cidade, bairro, rua, numero, complemento
+                   celular, cep, cidade, bairro, rua, numero, complemento,
+                   admin, verificacao_estudante_status
             FROM usuarios WHERE id = %s
             """,
             (int(payload["sub"]),),
@@ -449,12 +451,10 @@ def me(payload: dict = Depends(verificar_token)):
         if not row:
             raise HTTPException(status_code=404, detail="Usuário não encontrado")
         (user_id, cpf, nome, email, tipo, saldo, bloqueado,
-         celular, cep, cidade, bairro, rua, numero, complemento) = row
+         celular, cep, cidade, bairro, rua, numero, complemento,
+         admin, verificacao_estudante_status) = row
         saldo   = float(saldo)
         tarifa  = tarifa_do_usuario(tipo)
-        # passes_disponiveis é sempre calculado a partir do saldo (quantas
-        # passagens o saldo atual cobre); para idoso/PCD, que não pagam, não
-        # há um número de passes limitado pelo saldo.
         passes = None if tarifa == 0 else round(saldo / tarifa, 1)
         return {
             "id":                 user_id,
@@ -473,6 +473,8 @@ def me(payload: dict = Depends(verificar_token)):
             "rua":                rua,
             "numero":             numero,
             "complemento":        complemento,
+            "admin":              bool(admin),
+            "verificacao_estudante_status": verificacao_estudante_status,
         }
     finally:
         cur.close()
@@ -586,8 +588,177 @@ def atualizar_tipo_usuario(data: TipoUsuarioRequest, payload: dict = Depends(ver
         cur.close()
         conn.close()
 
+class SolicitarEstudanteRequest(BaseModel):
+    escola_nome: str
+    escola_email: str
 
-# ── RECARGA (PIX) ─────────────────────────────────────────────────────────────
+class ResolverSolicitacaoRequest(BaseModel):
+    aprovar: bool
+
+def _resolver_verificacao_estudante(cur, conn, user_id: int, aprovado: bool) -> str:
+    if aprovado:
+        cur.execute(
+            """UPDATE usuarios
+               SET tipo_usuario = 'estudante', verificacao_estudante_status = 'aprovado',
+                   verificacao_estudante_token = NULL
+               WHERE id = %s""",
+            (user_id,),
+        )
+    else:
+        cur.execute(
+            """UPDATE usuarios
+               SET verificacao_estudante_status = 'rejeitado', verificacao_estudante_token = NULL
+               WHERE id = %s""",
+            (user_id,),
+        )
+    conn.commit()
+
+    cur.execute("SELECT nome, email FROM usuarios WHERE id = %s", (user_id,))
+    nome, email = cur.fetchone()
+    try:
+        if aprovado:
+            enviar_email(
+                email,
+                "Matrícula confirmada — BusPasse",
+                f"Boa notícia, {nome}! Sua escola confirmou sua matrícula e sua tarifa de estudante já está ativa.",
+            )
+        else:
+            enviar_email(
+                email,
+                "Solicitação de estudante recusada — BusPasse",
+                f"Olá, {nome}. Sua escola não confirmou sua matrícula, então sua conta continua com a tarifa comum. Você pode tentar de novo com os dados corretos.",
+            )
+    except HTTPException:
+        pass  
+    return nome
+
+
+@app.post("/tipo-usuario/solicitar-estudante")
+def solicitar_estudante(data: SolicitarEstudanteRequest, payload: dict = Depends(verificar_token)):
+    """Inicia a verificação de matrícula: manda um email pra escola com links de aprovar/recusar."""
+    escola_email = data.escola_email.strip().lower()
+    if not EMAIL_REGEX.match(escola_email):
+        raise HTTPException(status_code=422, detail="Email da escola inválido")
+    escola_nome = data.escola_nome.strip()
+    if not escola_nome:
+        raise HTTPException(status_code=422, detail="Informe o nome da escola")
+
+    user_id = int(payload["sub"])
+    token = secrets.token_urlsafe(32)
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """UPDATE usuarios
+               SET escola_nome = %s, escola_email = %s,
+                   verificacao_estudante_status = 'pendente',
+                   verificacao_estudante_token = %s
+               WHERE id = %s""",
+            (escola_nome, escola_email, token, user_id),
+        )
+        conn.commit()
+
+        cur.execute("SELECT nome FROM usuarios WHERE id = %s", (user_id,))
+        nome_aluno = cur.fetchone()[0]
+
+        link_aprovar  = f"{API_BASE_URL}/tipo-usuario/confirmar/{token}?decisao=aprovar"
+        link_rejeitar = f"{API_BASE_URL}/tipo-usuario/confirmar/{token}?decisao=rejeitar"
+        enviar_email(
+            escola_email,
+            "Confirmação de matrícula — BusPasse",
+            (
+                f"O aluno {nome_aluno} solicitou o benefício de tarifa de estudante no aplicativo BusPasse, "
+                f"informando \"{escola_nome}\" como instituição de ensino.\n\n"
+                f"Para CONFIRMAR a matrícula, acesse: {link_aprovar}\n\n"
+                f"Para RECUSAR, acesse: {link_rejeitar}"
+            ),
+        )
+        return {"status": "pendente"}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/tipo-usuario/confirmar/{token}")
+def confirmar_estudante(token: str, decisao: str):
+    """
+    Rota pública (sem login) — é aberta direto no navegador quando a escola
+    clica no link recebido por email, por isso devolve uma página HTML
+    simples em vez de JSON.
+    """
+    if decisao not in ("aprovar", "rejeitar"):
+        return HTMLResponse("<h1>Link inválido.</h1>", status_code=400)
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id, verificacao_estudante_status FROM usuarios WHERE verificacao_estudante_token = %s",
+            (token,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return HTMLResponse("<h1>Link inválido ou já utilizado.</h1>", status_code=404)
+
+        user_id, status_atual = row
+        if status_atual != "pendente":
+            return HTMLResponse("<h1>Essa solicitação já foi respondida anteriormente.</h1>")
+
+        nome = _resolver_verificacao_estudante(cur, conn, user_id, aprovado=(decisao == "aprovar"))
+        mensagem = "Matrícula confirmada" if decisao == "aprovar" else "Solicitação recusada"
+        return HTMLResponse(f"<h1>{mensagem} para {nome}. Obrigado!</h1>")
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/admin/solicitacoes-estudante")
+def listar_solicitacoes_estudante(payload: dict = Depends(exigir_admin)):
+    """Lista pedidos de verificação de estudante pendentes (uso do painel administrativo)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT id, nome, email, escola_nome, escola_email
+               FROM usuarios
+               WHERE verificacao_estudante_status = 'pendente'
+               ORDER BY id"""
+        )
+        rows = cur.fetchall()
+        return [
+            {"id": r[0], "nome": r[1], "email": r[2], "escola_nome": r[3], "escola_email": r[4]}
+            for r in rows
+        ]
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/admin/solicitacoes-estudante/{user_id}")
+def resolver_solicitacao_estudante(user_id: int, data: ResolverSolicitacaoRequest, payload: dict = Depends(exigir_admin)):
+    """Aprova ou recusa uma solicitação pendente pelo painel administrativo."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT verificacao_estudante_status FROM usuarios WHERE id = %s", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado")
+        if row[0] != "pendente":
+            raise HTTPException(status_code=409, detail="Essa solicitação já foi respondida")
+
+        _resolver_verificacao_estudante(cur, conn, user_id, aprovado=data.aprovar)
+        return {"status": "ok"}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
 @app.post("/recarga", status_code=201)
 def criar_recarga(data: RecargaRequest, payload: dict = Depends(verificar_token)):
     """Cria uma recarga pendente e gera o Pix Copia e Cola correspondente."""
@@ -758,7 +929,6 @@ def extrato(payload: dict = Depends(verificar_token)):
         conn.close()
 
 
-# ── PASSAGEM ──────────────────────────────────────────────────────────────────
 @app.post("/passagem/usar", status_code=201)
 def usar_passagem(payload: dict = Depends(verificar_token)):
     """
@@ -815,7 +985,6 @@ def usar_passagem(payload: dict = Depends(verificar_token)):
         conn.close()
 
 
-# ── CARTÃO ────────────────────────────────────────────────────────────────────
 @app.post("/cartao/bloquear")
 def bloquear_cartao(payload: dict = Depends(verificar_token)):
     """Bloqueia o cartão do usuário autenticado."""
