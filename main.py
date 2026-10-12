@@ -240,10 +240,60 @@ class VerificarEmailRequest(BaseModel):
 class ReenviarCodigoRequest(BaseModel):
     email: str
 
+class VerificarCartaoRequest(BaseModel):
+    uid_cartao: str
+    
 @app.get("/")
 def root():
     return {"status": "ok", "api": "BusPasse API", "versao": "1.0.0"}
 
+
+
+@app.post("/cartao/verificar")
+def verificar_cartao(data: VerificarCartaoRequest):
+    """Verifica se o UID do cartão está cadastrado."""
+
+    uid = re.sub(r"[\s:-]", "", data.uid_cartao).upper()
+
+    if uid.startswith("0X"):
+        uid = uid[2:]
+
+    if not uid or not re.fullmatch(r"[0-9A-F]+", uid):
+        raise HTTPException(
+            status_code=422,
+            detail="UID do cartão inválido"
+        )
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT id
+            FROM usuarios
+            WHERE REPLACE(
+                REPLACE(
+                    REPLACE(
+                        REPLACE(UPPER(uid_cartao), ' ', ''),
+                        ':', ''
+                    ),
+                    '-', ''
+                ),
+                '0X', ''
+            ) = %s
+            LIMIT 1
+            """,
+            (uid,),
+        )
+
+        usuario = cur.fetchone()
+
+        return {"cadastrado": usuario is not None}
+
+    finally:
+        cur.close()
+        conn.close()
 
 @app.post("/login")
 def login(data: LoginRequest):
