@@ -43,3 +43,6 @@ CREATE TABLE IF NOT EXISTS transacoes (
 );
 
 CREATE INDEX idx_transacoes_usuario ON transacoes(usuario_id);
+
+ALTER TABLE usuarios
+ADD COLUMN uid_cartao VARCHAR(50) NULL;
