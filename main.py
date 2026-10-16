@@ -251,7 +251,7 @@ def root():
 
 @app.post("/cartao/verificar")
 def verificar_cartao(data: VerificarCartaoRequest):
-    """Verifica se o UID do cartão está cadastrado."""
+    """Verifica se o cartão está cadastrado e se está bloqueado."""
 
     uid = re.sub(r"[\s:-]", "", data.uid_cartao).upper()
 
@@ -270,7 +270,7 @@ def verificar_cartao(data: VerificarCartaoRequest):
     try:
         cur.execute(
             """
-            SELECT id
+            SELECT id, cartao_bloqueado
             FROM usuarios
             WHERE REPLACE(
                 REPLACE(
@@ -289,37 +289,36 @@ def verificar_cartao(data: VerificarCartaoRequest):
 
         usuario = cur.fetchone()
 
-        return {"cadastrado": usuario is not None}
+        # Cartão não cadastrado
+        if usuario is None:
+            return {
+                "cadastrado": False,
+                "cartao_bloqueado": None,
+                "autorizado": False,
+                "mensagem": "Cartao nao cadastrado"
+            }
 
-    finally:
-        cur.close()
-        conn.close()
+        # Dados encontrados no banco
+        usuario_id, bloqueado = usuario
+        bloqueado = bool(bloqueado)
 
-@app.post("/login")
-def login(data: LoginRequest):
-    """Autentica usuário por email + senha e retorna JWT."""
-    conn = get_conn()
-    cur  = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id, nome, senha_hash, email_verificado FROM usuarios WHERE email = %s",
-            (data.email.lower().strip(),),
-        )
-        row = cur.fetchone()
+        # Cartão cadastrado, mas bloqueado
+        if bloqueado:
+            return {
+                "cadastrado": True,
+                "cartao_bloqueado": True,
+                "autorizado": False,
+                "mensagem": "Cartao bloqueado"
+            }
 
-        if not row:
-            raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+        # Cartão cadastrado e liberado
+        return {
+            "cadastrado": True,
+            "cartao_bloqueado": False,
+            "autorizado": True,
+            "mensagem": "Cartao liberado"
+        }
 
-        user_id, nome, senha_hash, verificado = row
-
-        if not bcrypt.checkpw(data.senha.encode(), senha_hash.encode()):
-            raise HTTPException(status_code=401, detail="Email ou senha incorretos")
-
-        if not verificado:
-            raise HTTPException(status_code=403, detail="Confirme seu email antes de entrar. Verifique sua caixa de entrada.")
-
-        token = criar_token(user_id, nome)
-        return {"token": token, "nome": nome, "id": user_id}
     finally:
         cur.close()
         conn.close()
