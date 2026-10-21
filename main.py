@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 load_dotenv()
 
+# ── CONFIGURAÇÃO ──────────────────────────────────────────────────────────────
 SECRET_KEY        = os.getenv("JWT_SECRET", "troque-isso-por-um-segredo-forte-aleatorio")
 ALGORITHM         = "HS256"
 TOKEN_EXPIRE_DAYS = 7
@@ -32,17 +33,37 @@ DB_CONFIG = {
     "port":     int(os.getenv("DB_PORT", "3306")),
 }
 
+# Chave Pix estática da empresa/beneficiário que recebe as recargas.
+# Sem um PSP (Mercado Pago, Efí, etc.) o backend não recebe webhook de
+# confirmação automática — por isso o app confirma o pagamento manualmente
+# via POST /recarga/{id}/confirmar (ver docstring do endpoint).
 PIX_KEY           = os.getenv("PIX_KEY", "")
 PIX_MERCHANT_NAME = os.getenv("PIX_MERCHANT_NAME", "BUSPASSE LTDA")
 PIX_MERCHANT_CITY = os.getenv("PIX_MERCHANT_CITY", "SAO PAULO")
 PRECO_PASSAGEM    = float(os.getenv("PRECO_PASSAGEM", "5.75"))
 
+# Envio de email para confirmação de cadastro/login, via API HTTP da Brevo
+# (https://api.brevo.com/v3/smtp/email) em vez de SMTP — hospedagens
+# gratuitas como o Render costumam bloquear/travar a porta de SMTP (587),
+# mas a API HTTP passa pela porta 443, que nunca é bloqueada.
 BREVO_API_KEY           = os.getenv("BREVO_API_KEY", "")
 BREVO_FROM_EMAIL        = os.getenv("BREVO_FROM_EMAIL", "")
 CODIGO_VALIDADE_MINUTOS = 15
 
+# URL pública da própria API — usada para montar os links de aprovar/recusar
+# no email mandado pra escola (POST /tipo-usuario/solicitar-estudante).
 API_BASE_URL = os.getenv("API_BASE_URL", "https://tcc-82gl.onrender.com")
 
+# Pagamento por aproximação com o celular (NFC). O app pede um token de uso
+# único e vida curta, o celular entrega esse token ao leitor do ônibus e o
+# leitor confirma na API (POST /nfc/validar). Não dá pra identificar o celular
+# pelo UID como no cartão físico: o Android muda de UID a cada aproximação
+# quando emula um cartão (HCE).
+NFC_TOKEN_VALIDADE_SEGUNDOS = 120
+NFC_TOKEN_REGEX             = re.compile(r"^[0-9a-f]{16}$")
+
+# Tipos que não pagam tarifa (isenção prevista em lei para idosos e, em regra,
+# pessoas com deficiência no transporte coletivo municipal).
 TIPOS_GRATUITOS = {"idoso", "pcd"}
 
 def tarifa_do_usuario(tipo_usuario: str) -> float:
@@ -54,11 +75,12 @@ def tarifa_do_usuario(tipo_usuario: str) -> float:
         return 0.0
     return PRECO_PASSAGEM
 
+# ── APLICAÇÃO ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="BusPasse API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          
+    allow_origins=["*"],          # Em produção: especifique o domínio do frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -105,6 +127,7 @@ class LoginRequest(BaseModel):
     email: str
     senha: str
 
+# ── PIX (BR CODE ESTÁTICO) ────────────────────────────────────────────────────
 def _tlv(id_: str, valor: str) -> str:
     """Codifica um campo no formato TLV (ID + tamanho de 2 dígitos + valor) do EMV/BR Code."""
     return f"{id_}{len(valor):02d}{valor}"
@@ -139,6 +162,7 @@ def cpf_valido(cpf: str) -> bool:
     return cpf[-2:] == d1 + d2
 
 
+# ── EMAIL DE CONFIRMAÇÃO ───────────────────────────────────────────────────────
 def gerar_codigo_verificacao() -> str:
     """Gera um código numérico de 6 dígitos para confirmar email."""
     return f"{random.randint(0, 999999):06d}"
@@ -185,17 +209,17 @@ def gerar_payload_pix(chave: str, nome: str, cidade: str, valor: float, txid: st
 
     conta_pix = _tlv("00", "br.gov.bcb.pix") + _tlv("01", chave)
     payload = (
-        _tlv("00", "01")             
-        + _tlv("26", conta_pix)      
-        + _tlv("52", "0000")         
-        + _tlv("53", "986")          
-        + _tlv("54", f"{valor:.2f}") 
-        + _tlv("58", "BR")           
-        + _tlv("59", nome)           
-        + _tlv("60", cidade)         
-        + _tlv("62", _tlv("05", txid))  
+        _tlv("00", "01")             # Payload Format Indicator
+        + _tlv("26", conta_pix)      # Merchant Account Information (Pix)
+        + _tlv("52", "0000")         # Merchant Category Code
+        + _tlv("53", "986")          # Moeda: Real (BRL)
+        + _tlv("54", f"{valor:.2f}") # Valor da transação
+        + _tlv("58", "BR")           # País
+        + _tlv("59", nome)           # Nome do beneficiário
+        + _tlv("60", cidade)         # Cidade do beneficiário
+        + _tlv("62", _tlv("05", txid))  # Additional Data Field (txid de referência)
     )
-    payload += "6304"  
+    payload += "6304"  # ID + tamanho do campo CRC16 que vem a seguir
     return payload + _crc16_ccitt(payload)
 
 
@@ -242,16 +266,19 @@ class ReenviarCodigoRequest(BaseModel):
 
 class VerificarCartaoRequest(BaseModel):
     uid_cartao: str
-    
+
+class ValidarNfcRequest(BaseModel):
+    token_nfc: str
+
 @app.get("/")
 def root():
     return {"status": "ok", "api": "BusPasse API", "versao": "1.0.0"}
 
 
-
+# ── LEITOR DO ÔNIBUS (ESP32 + RC522) ──────────────────────────────────────────
 @app.post("/cartao/verificar")
 def verificar_cartao(data: VerificarCartaoRequest):
-    """Verifica se o cartão está cadastrado e se está bloqueado."""
+    """Verifica se o cartão está cadastrado e se está bloqueado. Chamado pelo leitor (ESP32)."""
 
     uid = re.sub(r"[\s:-]", "", data.uid_cartao).upper()
 
@@ -324,6 +351,37 @@ def verificar_cartao(data: VerificarCartaoRequest):
         conn.close()
 
 
+
+@app.post("/login")
+def login(data: LoginRequest):
+    """Autentica usuário por email + senha e retorna JWT."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id, nome, senha_hash, email_verificado FROM usuarios WHERE email = %s",
+            (data.email.lower().strip(),),
+        )
+        row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+
+        user_id, nome, senha_hash, verificado = row
+
+        if not bcrypt.checkpw(data.senha.encode(), senha_hash.encode()):
+            raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+
+        if not verificado:
+            raise HTTPException(status_code=403, detail="Confirme seu email antes de entrar. Verifique sua caixa de entrada.")
+
+        token = criar_token(user_id, nome)
+        return {"token": token, "nome": nome, "id": user_id}
+    finally:
+        cur.close()
+        conn.close()
+
+
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CEP_REGEX   = re.compile(r"^\d{5}-?\d{3}$")
 
@@ -385,6 +443,9 @@ def cadastro(data: CadastroRequest):
         user_id = cur.lastrowid
         conn.commit()
 
+        # A conta já existe nesse ponto — se o envio do email falhar (ex.:
+        # SMTP fora do ar), o usuário pode pedir um novo código depois via
+        # POST /reenviar-codigo, sem precisar recadastrar.
         enviar_email(
             email_limpo,
             "Confirme seu cadastro — BusPasse",
@@ -504,6 +565,9 @@ def me(payload: dict = Depends(verificar_token)):
          admin, verificacao_estudante_status) = row
         saldo   = float(saldo)
         tarifa  = tarifa_do_usuario(tipo)
+        # passes_disponiveis é sempre calculado a partir do saldo (quantas
+        # passagens o saldo atual cobre); para idoso/PCD, que não pagam, não
+        # há um número de passes limitado pelo saldo.
         passes = None if tarifa == 0 else round(saldo / tarifa, 1)
         return {
             "id":                 user_id,
@@ -637,6 +701,12 @@ def atualizar_tipo_usuario(data: TipoUsuarioRequest, payload: dict = Depends(ver
         cur.close()
         conn.close()
 
+
+# ── VERIFICAÇÃO DE ESTUDANTE ───────────────────────────────────────────────────
+# Duas formas de aprovar a mesma solicitação: a escola clica num link recebido
+# por email (fluxo "oficial"), ou um administrador aprova pelo painel interno
+# do app (mais confiável de demonstrar, já que não depende de alguém de fora
+# responder o email na hora). As duas caem na mesma função de resolução.
 class SolicitarEstudanteRequest(BaseModel):
     escola_nome: str
     escola_email: str
@@ -678,7 +748,7 @@ def _resolver_verificacao_estudante(cur, conn, user_id: int, aprovado: bool) -> 
                 f"Olá, {nome}. Sua escola não confirmou sua matrícula, então sua conta continua com a tarifa comum. Você pode tentar de novo com os dados corretos.",
             )
     except HTTPException:
-        pass  
+        pass  # não deixa a aprovação falhar só porque o aviso ao aluno não foi enviado
     return nome
 
 
@@ -764,6 +834,7 @@ def confirmar_estudante(token: str, decisao: str):
         conn.close()
 
 
+# ── PAINEL ADMINISTRATIVO ──────────────────────────────────────────────────────
 @app.get("/admin/solicitacoes-estudante")
 def listar_solicitacoes_estudante(payload: dict = Depends(exigir_admin)):
     """Lista pedidos de verificação de estudante pendentes (uso do painel administrativo)."""
@@ -808,6 +879,8 @@ def resolver_solicitacao_estudante(user_id: int, data: ResolverSolicitacaoReques
         cur.close()
         conn.close()
 
+
+# ── RECARGA (PIX) ─────────────────────────────────────────────────────────────
 @app.post("/recarga", status_code=201)
 def criar_recarga(data: RecargaRequest, payload: dict = Depends(verificar_token)):
     """Cria uma recarga pendente e gera o Pix Copia e Cola correspondente."""
@@ -978,6 +1051,7 @@ def extrato(payload: dict = Depends(verificar_token)):
         conn.close()
 
 
+# ── PASSAGEM ──────────────────────────────────────────────────────────────────
 @app.post("/passagem/usar", status_code=201)
 def usar_passagem(payload: dict = Depends(verificar_token)):
     """
@@ -1034,6 +1108,7 @@ def usar_passagem(payload: dict = Depends(verificar_token)):
         conn.close()
 
 
+# ── CARTÃO ────────────────────────────────────────────────────────────────────
 @app.post("/cartao/bloquear")
 def bloquear_cartao(payload: dict = Depends(verificar_token)):
     """Bloqueia o cartão do usuário autenticado."""
@@ -1057,6 +1132,173 @@ def desbloquear_cartao(payload: dict = Depends(verificar_token)):
         cur.execute("UPDATE usuarios SET cartao_bloqueado = FALSE WHERE id = %s", (int(payload["sub"]),))
         conn.commit()
         return {"cartao_bloqueado": False}
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ── NFC: CELULAR COMO CARTÃO ──────────────────────────────────────────────────
+# Fluxo: o app chama POST /nfc/token → o celular entrega o token ao leitor por
+# NFC → o leitor chama POST /nfc/validar → o app descobre o resultado em
+# GET /nfc/status. O token vale NFC_TOKEN_VALIDADE_SEGUNDOS e só pode ser usado
+# uma vez.
+@app.post("/nfc/token")
+def gerar_token_nfc(payload: dict = Depends(verificar_token)):
+    """
+    Gera o token que o celular vai entregar ao leitor. Só emite se o cartão não
+    estiver bloqueado e houver saldo para a tarifa do usuário. O leitor confere
+    tudo de novo na hora (POST /nfc/validar); essa checagem aqui só evita o
+    usuário aproximar o celular à toa. Cada novo token invalida o anterior.
+    """
+    user_id = int(payload["sub"])
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT saldo, tipo_usuario, cartao_bloqueado FROM usuarios WHERE id = %s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado")
+        saldo, tipo, bloqueado = row
+
+        if bloqueado:
+            raise HTTPException(status_code=423, detail="Cartão bloqueado. Desbloqueie para usar o passe.")
+
+        tarifa = tarifa_do_usuario(tipo)
+        if tarifa > 0 and float(saldo) < tarifa:
+            raise HTTPException(status_code=422, detail="Saldo insuficiente. Faça uma recarga.")
+
+        token     = secrets.token_hex(8)  # 16 caracteres hexadecimais
+        expira_em = datetime.utcnow() + timedelta(seconds=NFC_TOKEN_VALIDADE_SEGUNDOS)
+        cur.execute(
+            """UPDATE usuarios
+               SET nfc_token = %s, nfc_token_expira_em = %s, nfc_resultado = NULL
+               WHERE id = %s""",
+            (token, expira_em, user_id),
+        )
+        conn.commit()
+        return {"token": token, "validade_segundos": NFC_TOKEN_VALIDADE_SEGUNDOS}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/nfc/status")
+def status_token_nfc(payload: dict = Depends(verificar_token)):
+    """
+    Situação do token NFC do usuário. O app consulta a cada poucos segundos
+    para saber se o leitor já respondeu. "resultado" fica nulo enquanto o
+    leitor não tentou validar; depois vira "ok" ou o motivo da recusa
+    (cartao_bloqueado, saldo_insuficiente, token_expirado).
+    """
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT nfc_token, nfc_token_expira_em, nfc_resultado FROM usuarios WHERE id = %s",
+            (int(payload["sub"]),),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado")
+        token, expira_em, resultado = row
+        ativo = bool(token) and expira_em is not None and datetime.utcnow() <= expira_em
+        return {"ativo": ativo, "resultado": resultado}
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/nfc/cancelar")
+def cancelar_token_nfc(payload: dict = Depends(verificar_token)):
+    """Invalida o token NFC atual (o app chama ao cancelar ou sair da tela)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE usuarios SET nfc_token = NULL, nfc_token_expira_em = NULL WHERE id = %s",
+            (int(payload["sub"]),),
+        )
+        conn.commit()
+        return {"status": "ok"}
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/nfc/validar")
+def validar_nfc(data: ValidarNfcRequest):
+    """
+    Chamado pelo leitor do ônibus (ESP32) com o token lido do celular. Aplica
+    as mesmas regras do /passagem/usar (cartão bloqueado, saldo, tarifa por
+    tipo de usuário) e, se tudo estiver certo, debita a passagem. O token é de
+    uso único: qualquer tentativa (aprovada ou recusada) o consome.
+
+    Responde sempre 200 com {"cadastrado": bool, "motivo": ...}. O campo
+    "cadastrado" é o mesmo que o leitor já entende em /cartao/verificar, então
+    o leitor só precisa decidir entre acender o LED verde ou o vermelho.
+    """
+    token = data.token_nfc.strip().lower()
+    if not NFC_TOKEN_REGEX.match(token):
+        return {"cadastrado": False, "motivo": "token_invalido"}
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT id, saldo, tipo_usuario, cartao_bloqueado, nfc_token_expira_em
+               FROM usuarios WHERE nfc_token = %s FOR UPDATE""",
+            (token,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"cadastrado": False, "motivo": "token_invalido"}
+
+        user_id, saldo, tipo, bloqueado, expira_em = row
+        saldo  = float(saldo)
+        tarifa = tarifa_do_usuario(tipo)
+
+        if not expira_em or datetime.utcnow() > expira_em:
+            motivo = "token_expirado"
+        elif bloqueado:
+            motivo = "cartao_bloqueado"
+        elif tarifa > 0 and saldo < tarifa:
+            motivo = "saldo_insuficiente"
+        else:
+            motivo = "ok"
+
+        if motivo == "ok":
+            if tarifa > 0:
+                cur.execute("UPDATE usuarios SET saldo = saldo - %s WHERE id = %s", (tarifa, user_id))
+                saldo = round(saldo - tarifa, 2)
+            descricao = "Passagem utilizada (celular NFC)" if tarifa > 0 else "Passagem utilizada (celular NFC, gratuita)"
+            cur.execute(
+                """
+                INSERT INTO transacoes (usuario_id, tipo, valor, descricao, status, pago_em)
+                VALUES (%s, 'debito', %s, %s, 'pago', NOW())
+                """,
+                (user_id, tarifa, descricao),
+            )
+
+        cur.execute(
+            """UPDATE usuarios
+               SET nfc_token = NULL, nfc_token_expira_em = NULL, nfc_resultado = %s
+               WHERE id = %s""",
+            (motivo, user_id),
+        )
+        conn.commit()
+        return {"cadastrado": motivo == "ok", "motivo": motivo, "saldo": saldo, "tarifa": tarifa}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro interno: {e}")
     finally:
         cur.close()
         conn.close()
