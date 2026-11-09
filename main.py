@@ -276,9 +276,54 @@ def root():
 
 
 # ── LEITOR DO ÔNIBUS (ESP32 + RC522) ──────────────────────────────────────────
+# Mensagens curtas (sem acento, cabem no LCD do leitor) para cada resultado.
+MENSAGENS_LEITOR = {
+    "ok":                 "Cartao liberado",
+    "cartao_bloqueado":   "Cartao bloqueado",
+    "saldo_insuficiente": "Saldo insuficiente",
+}
+
+def _cobrar_passagem(cur, user_id: int, saldo: float, tipo: str, bloqueado: bool, origem: str):
+    """
+    Regras de uso da passagem, as mesmas para o cartão físico e para o celular
+    (NFC): cartão bloqueado nega; saldo menor que a tarifa nega; senão debita a
+    tarifa do tipo de usuário (comum cheia, estudante metade, idoso/PCD grátis)
+    e registra a passagem no extrato. Não faz commit: quem chama decide.
+
+    Devolve (motivo, saldo_atual, tarifa); motivo é "ok" quando a passagem foi
+    cobrada, ou o motivo da recusa.
+    """
+    tarifa = tarifa_do_usuario(tipo)
+    if bloqueado:
+        return "cartao_bloqueado", saldo, tarifa
+    if tarifa > 0 and saldo < tarifa:
+        return "saldo_insuficiente", saldo, tarifa
+
+    if tarifa > 0:
+        cur.execute("UPDATE usuarios SET saldo = saldo - %s WHERE id = %s", (tarifa, user_id))
+        saldo = round(saldo - tarifa, 2)
+    descricao = f"Passagem utilizada ({origem})" if tarifa > 0 else f"Passagem utilizada ({origem}, gratuita)"
+    cur.execute(
+        """
+        INSERT INTO transacoes (usuario_id, tipo, valor, descricao, status, pago_em)
+        VALUES (%s, 'debito', %s, %s, 'pago', NOW())
+        """,
+        (user_id, tarifa, descricao),
+    )
+    return "ok", saldo, tarifa
+
+
 @app.post("/cartao/verificar")
 def verificar_cartao(data: VerificarCartaoRequest):
-    """Verifica se o cartão está cadastrado e se está bloqueado. Chamado pelo leitor (ESP32)."""
+    """
+    Chamado pelo leitor (ESP32) quando um cartão físico é aproximado. Procura o
+    dono do UID e aplica as regras de uso da passagem: cartão bloqueado ou saldo
+    insuficiente negam; caso contrário debita a tarifa do tipo de usuário e
+    registra a passagem no extrato (igual ao POST /passagem/usar do app).
+
+    A resposta mantém os campos que o leitor já entende (cadastrado,
+    cartao_bloqueado, autorizado, mensagem) e acrescenta motivo, saldo e tarifa.
+    """
 
     uid = re.sub(r"[\s:-]", "", data.uid_cartao).upper()
 
@@ -297,7 +342,7 @@ def verificar_cartao(data: VerificarCartaoRequest):
     try:
         cur.execute(
             """
-            SELECT id, cartao_bloqueado
+            SELECT id
             FROM usuarios
             WHERE REPLACE(
                 REPLACE(
@@ -322,33 +367,41 @@ def verificar_cartao(data: VerificarCartaoRequest):
                 "cadastrado": False,
                 "cartao_bloqueado": None,
                 "autorizado": False,
-                "mensagem": "Cartao nao cadastrado"
+                "mensagem": "Cartao nao cadastrado",
+                "motivo": "nao_cadastrado",
             }
 
-        # Dados encontrados no banco
-        usuario_id, bloqueado = usuario
+        # Trava só a linha desse usuário enquanto confere o saldo e debita
+        cur.execute(
+            "SELECT saldo, tipo_usuario, cartao_bloqueado FROM usuarios WHERE id = %s FOR UPDATE",
+            (usuario[0],),
+        )
+        saldo, tipo, bloqueado = cur.fetchone()
         bloqueado = bool(bloqueado)
 
-        # Cartão cadastrado, mas bloqueado
-        if bloqueado:
-            return {
-                "cadastrado": True,
-                "cartao_bloqueado": True,
-                "autorizado": False,
-                "mensagem": "Cartao bloqueado"
-            }
+        motivo, saldo, tarifa = _cobrar_passagem(cur, usuario[0], float(saldo), tipo, bloqueado, "cartão")
+        conn.commit()
 
-        # Cartão cadastrado e liberado
         return {
             "cadastrado": True,
-            "cartao_bloqueado": False,
-            "autorizado": True,
-            "mensagem": "Cartao liberado"
+            "cartao_bloqueado": bloqueado,
+            "autorizado": motivo == "ok",
+            "mensagem": MENSAGENS_LEITOR[motivo],
+            "motivo": motivo,
+            "saldo": saldo,
+            "tarifa": tarifa,
         }
 
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro interno: {e}")
     finally:
         cur.close()
         conn.close()
+
 
 
 
@@ -1265,25 +1318,8 @@ def validar_nfc(data: ValidarNfcRequest):
 
         if not expira_em or datetime.utcnow() > expira_em:
             motivo = "token_expirado"
-        elif bloqueado:
-            motivo = "cartao_bloqueado"
-        elif tarifa > 0 and saldo < tarifa:
-            motivo = "saldo_insuficiente"
         else:
-            motivo = "ok"
-
-        if motivo == "ok":
-            if tarifa > 0:
-                cur.execute("UPDATE usuarios SET saldo = saldo - %s WHERE id = %s", (tarifa, user_id))
-                saldo = round(saldo - tarifa, 2)
-            descricao = "Passagem utilizada (celular NFC)" if tarifa > 0 else "Passagem utilizada (celular NFC, gratuita)"
-            cur.execute(
-                """
-                INSERT INTO transacoes (usuario_id, tipo, valor, descricao, status, pago_em)
-                VALUES (%s, 'debito', %s, %s, 'pago', NOW())
-                """,
-                (user_id, tarifa, descricao),
-            )
+            motivo, saldo, tarifa = _cobrar_passagem(cur, user_id, saldo, tipo, bool(bloqueado), "celular NFC")
 
         cur.execute(
             """UPDATE usuarios
