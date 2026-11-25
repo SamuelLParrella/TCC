@@ -1,4 +1,5 @@
 
+import hmac
 import json
 import os
 import random
@@ -38,7 +39,7 @@ DB_CONFIG = {
 # confirmação automática — por isso o app confirma o pagamento manualmente
 # via POST /recarga/{id}/confirmar (ver docstring do endpoint).
 PIX_KEY           = os.getenv("PIX_KEY", "")
-PIX_MERCHANT_NAME = os.getenv("PIX_MERCHANT_NAME", "BUSPASSE LTDA")
+PIX_MERCHANT_NAME = os.getenv("PIX_MERCHANT_NAME", "QUICKPASS")
 PIX_MERCHANT_CITY = os.getenv("PIX_MERCHANT_CITY", "SAO PAULO")
 PRECO_PASSAGEM    = float(os.getenv("PRECO_PASSAGEM", "5.75"))
 
@@ -53,6 +54,18 @@ CODIGO_VALIDADE_MINUTOS = 15
 # URL pública da própria API — usada para montar os links de aprovar/recusar
 # no email mandado pra escola (POST /tipo-usuario/solicitar-estudante).
 API_BASE_URL = os.getenv("API_BASE_URL", "https://tcc-82gl.onrender.com")
+
+# Chave secreta do leitor do ônibus (ESP32). Os endpoints que só o leitor
+# chama (/cartao/verificar e /nfc/validar) exigem o cabeçalho X-Leitor-Key com
+# este valor. Sem isso, qualquer pessoa na internet poderia descontar passagens
+# ou descobrir quais cartões existem. Defina LEITOR_API_KEY no Render e use a
+# mesma chave no segredos.h do firmware. Sem a variável, o leitor é recusado.
+LEITOR_API_KEY = os.getenv("LEITOR_API_KEY", "")
+
+# Cartão digital: todo usuário recebe um UID próprio (7 bytes), sem cartão
+# físico. Ele começa com 0x51 0x50 ("QP" em ASCII) para dar para reconhecer os
+# digitais; os cartões físicos continuam sendo cadastrados direto no banco.
+UID_DIGITAL_PREFIXO = "5150"
 
 # Pagamento por aproximação com o celular (NFC). O app pede um token de uso
 # único e vida curta, o celular entrega esse token ao leitor do ônibus e o
@@ -76,7 +89,7 @@ def tarifa_do_usuario(tipo_usuario: str) -> float:
     return PRECO_PASSAGEM
 
 # ── APLICAÇÃO ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="BusPasse API", version="1.0.0")
+app = FastAPI(title="QUICKPASS API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -122,6 +135,40 @@ def exigir_admin(payload: dict = Depends(verificar_token)) -> dict:
     finally:
         cur.close()
         conn.close()
+
+def exigir_leitor(x_leitor_key: str = Header(default="")) -> None:
+    """Dependência das rotas chamadas só pelo leitor do ônibus: confere o cabeçalho X-Leitor-Key."""
+    if not LEITOR_API_KEY:
+        # Sem chave configurada o servidor recusa tudo (nunca fica aberto por esquecimento).
+        raise HTTPException(status_code=503, detail="Leitor não configurado: defina LEITOR_API_KEY no servidor")
+    if not hmac.compare_digest(x_leitor_key.encode("utf-8"), LEITOR_API_KEY.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Chave do leitor inválida")
+
+
+# ── CARTÃO (UID) ──────────────────────────────────────────────────────────────
+# Mesma normalização que o leitor usa: sem espaço, ":" ou "-", em maiúsculas e
+# sem o prefixo "0x". Vale para o UID enviado e para o gravado no banco.
+_SQL_UID_NORMALIZADO = (
+    "REPLACE(REPLACE(REPLACE(REPLACE(UPPER(uid_cartao), ' ', ''), ':', ''), '-', ''), '0X', '')"
+)
+
+def _normalizar_uid(uid: str | None) -> str:
+    uid = re.sub(r"[\s:-]", "", uid or "").upper()
+    return uid[2:] if uid.startswith("0X") else uid
+
+def _tipo_cartao(uid: str | None) -> str:
+    """'digital' para UIDs criados pelo sistema; 'fisico' para os cadastrados à mão no banco."""
+    uid = _normalizar_uid(uid)
+    return "digital" if len(uid) == 14 and uid.startswith(UID_DIGITAL_PREFIXO) else "fisico"
+
+def _uid_digital_novo(cur) -> str:
+    """Sorteia um UID digital que ainda não pertence a nenhum usuário."""
+    for _ in range(20):
+        uid = UID_DIGITAL_PREFIXO + secrets.token_hex(5).upper()
+        cur.execute(f"SELECT 1 FROM usuarios WHERE {_SQL_UID_NORMALIZADO} = %s LIMIT 1", (uid,))
+        if cur.fetchone() is None:
+            return uid
+    raise HTTPException(status_code=500, detail="Não foi possível gerar o cartão digital")
 
 class LoginRequest(BaseModel):
     email: str
@@ -175,7 +222,7 @@ def enviar_email(destinatario: str, assunto: str, corpo: str) -> None:
         raise HTTPException(status_code=503, detail="Serviço de email não configurado no servidor")
 
     payload = json.dumps({
-        "sender": {"email": BREVO_FROM_EMAIL, "name": "BusPasse"},
+        "sender": {"email": BREVO_FROM_EMAIL, "name": "QUICKPASS"},
         "to": [{"email": destinatario}],
         "subject": assunto,
         "textContent": corpo,
@@ -203,7 +250,7 @@ def enviar_email(destinatario: str, assunto: str, corpo: str) -> None:
 
 def gerar_payload_pix(chave: str, nome: str, cidade: str, valor: float, txid: str) -> str:
     """Monta o Pix Copia e Cola (BR Code) estático para uma chave Pix + valor fixo."""
-    nome   = _ascii_upper(nome)[:25] or "BUSPASSE"
+    nome   = _ascii_upper(nome)[:25] or "QUICKPASS"
     cidade = _ascii_upper(cidade)[:15] or "BRASIL"
     txid   = re.sub(r"[^A-Za-z0-9]", "", txid)[:25] or "***"
 
@@ -272,7 +319,7 @@ class ValidarNfcRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "api": "BusPasse API", "versao": "1.0.0"}
+    return {"status": "ok", "api": "QUICKPASS API", "versao": "1.0.0"}
 
 
 # ── LEITOR DO ÔNIBUS (ESP32 + RC522) ──────────────────────────────────────────
@@ -313,22 +360,20 @@ def _cobrar_passagem(cur, user_id: int, saldo: float, tipo: str, bloqueado: bool
     return "ok", saldo, tarifa
 
 
-@app.post("/cartao/verificar")
+@app.post("/cartao/verificar", dependencies=[Depends(exigir_leitor)])
 def verificar_cartao(data: VerificarCartaoRequest):
     """
-    Chamado pelo leitor (ESP32) quando um cartão físico é aproximado. Procura o
-    dono do UID e aplica as regras de uso da passagem: cartão bloqueado ou saldo
-    insuficiente negam; caso contrário debita a tarifa do tipo de usuário e
-    registra a passagem no extrato (igual ao POST /passagem/usar do app).
+    Chamado pelo leitor (ESP32) quando um cartão é aproximado (físico ou digital).
+    Só responde a quem enviar a chave do leitor no cabeçalho X-Leitor-Key.
+    Procura o dono do UID e aplica as regras de uso da passagem: cartão bloqueado
+    ou saldo insuficiente negam; caso contrário debita a tarifa do tipo de
+    usuário e registra a passagem no extrato (igual ao POST /passagem/usar do app).
 
     A resposta mantém os campos que o leitor já entende (cadastrado,
     cartao_bloqueado, autorizado, mensagem) e acrescenta motivo, saldo e tarifa.
     """
 
-    uid = re.sub(r"[\s:-]", "", data.uid_cartao).upper()
-
-    if uid.startswith("0X"):
-        uid = uid[2:]
+    uid = _normalizar_uid(data.uid_cartao)
 
     if not uid or not re.fullmatch(r"[0-9A-F]+", uid):
         raise HTTPException(
@@ -341,21 +386,7 @@ def verificar_cartao(data: VerificarCartaoRequest):
 
     try:
         cur.execute(
-            """
-            SELECT id
-            FROM usuarios
-            WHERE REPLACE(
-                REPLACE(
-                    REPLACE(
-                        REPLACE(UPPER(uid_cartao), ' ', ''),
-                        ':', ''
-                    ),
-                    '-', ''
-                ),
-                '0X', ''
-            ) = %s
-            LIMIT 1
-            """,
+            f"SELECT id FROM usuarios WHERE {_SQL_UID_NORMALIZADO} = %s LIMIT 1",
             (uid,),
         )
 
@@ -469,13 +500,14 @@ def cadastro(data: CadastroRequest):
         senha_hash = bcrypt.hashpw(data.senha.encode(), bcrypt.gensalt()).decode()
         codigo           = gerar_codigo_verificacao()
         codigo_expira_em = datetime.utcnow() + timedelta(minutes=CODIGO_VALIDADE_MINUTOS)
+        uid_digital      = _uid_digital_novo(cur)  # todo usuário nasce com um cartão digital
 
         cur.execute(
             """
             INSERT INTO usuarios
                 (cpf, nome, email, senha_hash, celular, cep, cidade, bairro, rua, numero, complemento,
-                 email_verificado, codigo_verificacao, codigo_expira_em)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s)
+                 uid_cartao, email_verificado, codigo_verificacao, codigo_expira_em)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s)
             """,
             (
                 cpf_limpo,
@@ -489,6 +521,7 @@ def cadastro(data: CadastroRequest):
                 data.rua,
                 data.numero,
                 data.complemento,
+                uid_digital,
                 codigo,
                 codigo_expira_em,
             ),
@@ -501,7 +534,7 @@ def cadastro(data: CadastroRequest):
         # POST /reenviar-codigo, sem precisar recadastrar.
         enviar_email(
             email_limpo,
-            "Confirme seu cadastro — BusPasse",
+            "Confirme seu cadastro — QUICKPASS",
             f"Seu código de confirmação é {codigo}. Ele expira em {CODIGO_VALIDADE_MINUTOS} minutos.",
         )
 
@@ -583,7 +616,7 @@ def reenviar_codigo(data: ReenviarCodigoRequest):
 
         enviar_email(
             email,
-            "Novo código de confirmação — BusPasse",
+            "Novo código de confirmação — QUICKPASS",
             f"Seu novo código de confirmação é {codigo}. Ele expira em {CODIGO_VALIDADE_MINUTOS} minutos.",
         )
         return {"status": "ok"}
@@ -597,7 +630,13 @@ def reenviar_codigo(data: ReenviarCodigoRequest):
 
 @app.get("/me")
 def me(payload: dict = Depends(verificar_token)):
-    """Retorna dados do usuário autenticado (requer Bearer token)."""
+    """
+    Retorna dados do usuário autenticado (requer Bearer token).
+
+    Quem ainda não tem cartão (contas criadas antes do cartão digital) ganha um
+    UID digital na primeira chamada; os cartões físicos cadastrados no banco
+    não são alterados.
+    """
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -605,7 +644,7 @@ def me(payload: dict = Depends(verificar_token)):
             """
             SELECT id, cpf, nome, email, tipo_usuario, saldo, cartao_bloqueado,
                    celular, cep, cidade, bairro, rua, numero, complemento,
-                   admin, verificacao_estudante_status
+                   admin, verificacao_estudante_status, uid_cartao
             FROM usuarios WHERE id = %s
             """,
             (int(payload["sub"]),),
@@ -615,7 +654,19 @@ def me(payload: dict = Depends(verificar_token)):
             raise HTTPException(status_code=404, detail="Usuário não encontrado")
         (user_id, cpf, nome, email, tipo, saldo, bloqueado,
          celular, cep, cidade, bairro, rua, numero, complemento,
-         admin, verificacao_estudante_status) = row
+         admin, verificacao_estudante_status, uid_cartao) = row
+
+        if not _normalizar_uid(uid_cartao):
+            cur.execute(
+                f"UPDATE usuarios SET uid_cartao = %s WHERE id = %s AND COALESCE({_SQL_UID_NORMALIZADO}, '') = ''",
+                (_uid_digital_novo(cur), user_id),
+            )
+            conn.commit()
+            # Se outra chamada ganhou a corrida, vale o UID que ficou gravado.
+            cur.execute("SELECT uid_cartao FROM usuarios WHERE id = %s", (user_id,))
+            uid_cartao = cur.fetchone()[0]
+        uid_cartao = _normalizar_uid(uid_cartao)
+
         saldo   = float(saldo)
         tarifa  = tarifa_do_usuario(tipo)
         # passes_disponiveis é sempre calculado a partir do saldo (quantas
@@ -641,6 +692,8 @@ def me(payload: dict = Depends(verificar_token)):
             "complemento":        complemento,
             "admin":              bool(admin),
             "verificacao_estudante_status": verificacao_estudante_status,
+            "uid_cartao":         uid_cartao,
+            "cartao_tipo":        _tipo_cartao(uid_cartao),
         }
     finally:
         cur.close()
@@ -791,13 +844,13 @@ def _resolver_verificacao_estudante(cur, conn, user_id: int, aprovado: bool) -> 
         if aprovado:
             enviar_email(
                 email,
-                "Matrícula confirmada — BusPasse",
+                "Matrícula confirmada — QUICKPASS",
                 f"Boa notícia, {nome}! Sua escola confirmou sua matrícula e sua tarifa de estudante já está ativa.",
             )
         else:
             enviar_email(
                 email,
-                "Solicitação de estudante recusada — BusPasse",
+                "Solicitação de estudante recusada — QUICKPASS",
                 f"Olá, {nome}. Sua escola não confirmou sua matrícula, então sua conta continua com a tarifa comum. Você pode tentar de novo com os dados corretos.",
             )
     except HTTPException:
@@ -837,9 +890,9 @@ def solicitar_estudante(data: SolicitarEstudanteRequest, payload: dict = Depends
         link_rejeitar = f"{API_BASE_URL}/tipo-usuario/confirmar/{token}?decisao=rejeitar"
         enviar_email(
             escola_email,
-            "Confirmação de matrícula — BusPasse",
+            "Confirmação de matrícula — QUICKPASS",
             (
-                f"O aluno {nome_aluno} solicitou o benefício de tarifa de estudante no aplicativo BusPasse, "
+                f"O aluno {nome_aluno} solicitou o benefício de tarifa de estudante no aplicativo QUICKPASS, "
                 f"informando \"{escola_nome}\" como instituição de ensino.\n\n"
                 f"Para CONFIRMAR a matrícula, acesse: {link_aprovar}\n\n"
                 f"Para RECUSAR, acesse: {link_rejeitar}"
@@ -1284,10 +1337,11 @@ def cancelar_token_nfc(payload: dict = Depends(verificar_token)):
         conn.close()
 
 
-@app.post("/nfc/validar")
+@app.post("/nfc/validar", dependencies=[Depends(exigir_leitor)])
 def validar_nfc(data: ValidarNfcRequest):
     """
-    Chamado pelo leitor do ônibus (ESP32) com o token lido do celular. Aplica
+    Chamado pelo leitor do ônibus (ESP32) com o token lido do celular; exige a
+    chave do leitor no cabeçalho X-Leitor-Key (como /cartao/verificar). Aplica
     as mesmas regras do /passagem/usar (cartão bloqueado, saldo, tarifa por
     tipo de usuário) e, se tudo estiver certo, debita a passagem. O token é de
     uso único: qualquer tentativa (aprovada ou recusada) o consome.
