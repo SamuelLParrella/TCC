@@ -7,19 +7,22 @@
 #include <LiquidCrystal_I2C.h>
 #include <ArduinoJson.h>
 
+// Wi-Fi e chave do leitor ficam no arquivo segredos.h (mesma pasta deste sketch).
+#include "segredos.h"
+
 // ==========================
 // WIFI E API
 // ==========================
 
-const char* ssid = "ATA";
-const char* password = "12345678";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_SENHA;
 
 // Cartao fisico (por UID): a API confere cadastro, bloqueio e saldo
 // e desconta a passagem do saldo.
 const char* apiURL =
   "https://tcc-82gl.onrender.com/cartao/verificar";
 
-// Celular com o app BusPasse (por token NFC): mesma regra do cartao,
+// Celular com o app QUICKPASS (por token NFC): mesma regra do cartao,
 // mas identificando o usuario pelo token que o app gerou.
 const char* apiURLNfc =
   "https://tcc-82gl.onrender.com/nfc/validar";
@@ -34,10 +37,10 @@ const char* apiURLNfc =
 MFRC522 rfid(SS_PIN, RST_PIN);
 
 // ==========================
-// CELULAR (NFC) - AID do BusPasse
+// CELULAR (NFC) - AID do QUICKPASS
 //
-// Precisa ser igual ao AID do app
-// (modules/buspass-hce): F0 + "BUSPASS".
+// Precisa ser igual ao AID do app (modules/buspass-hce): F0 + "BUSPASS".
+// O AID guarda o nome antigo do projeto de proposito: mudar quebraria o app ja instalado.
 //
 // Comando SELECT: 00 A4 04 00 08 <AID> 00
 // ==========================
@@ -74,6 +77,7 @@ const int RES_NAO_CADASTRADO = 0;  // cartao nao cadastrado
 const int RES_BLOQUEADO      = 2;  // cartao bloqueado
 const int RES_SEM_SALDO      = 3;  // saldo menor que a passagem
 const int RES_CODIGO         = 4;  // celular: codigo invalido ou vencido
+const int RES_SEM_ACESSO     = 5;  // a API recusou a chave do leitor (HTTP 401)
 const int RES_ERRO           = -1; // erro de conexao/API
 
 // ==========================
@@ -117,7 +121,13 @@ void telaInicial() {
 // Retorna true somente com HTTP 200 e JSON valido.
 // ==========================
 
+// Ultimo codigo HTTP recebido (0 = nao chegou resposta). Serve para
+// distinguir "chave do leitor recusada" (401) de uma falha qualquer.
+int ultimoHTTP = 0;
+
 bool consultarAPI(const char* url, const String &corpo, JsonDocument &doc) {
+
+  ultimoHTTP = 0;
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi desconectado.");
@@ -139,8 +149,11 @@ bool consultarAPI(const char* url, const String &corpo, JsonDocument &doc) {
 
   https.setTimeout(15000);
   https.addHeader("Content-Type", "application/json");
+  // Chave do leitor: sem ela a API recusa (HTTP 401). Vem do segredos.h.
+  https.addHeader("X-Leitor-Key", LEITOR_KEY);
 
   int codigoHTTP = https.POST(corpo);
+  ultimoHTTP = codigoHTTP;
   String resposta = "";
 
   if (codigoHTTP > 0) {
@@ -179,7 +192,7 @@ bool consultarAPI(const char* url, const String &corpo, JsonDocument &doc) {
 // desconta a passagem do saldo (tarifa conforme o tipo de usuario).
 //
 // Retorno: RES_LIBERADO, RES_NAO_CADASTRADO, RES_BLOQUEADO,
-//          RES_SEM_SALDO ou RES_ERRO.
+//          RES_SEM_SALDO, RES_SEM_ACESSO ou RES_ERRO.
 // saldo e tarifa vem da API (saldo ja com a passagem descontada).
 // ==========================
 
@@ -201,7 +214,7 @@ int verificarCartaoNaAPI(String uid, float &saldo, float &tarifa) {
   JsonDocument doc;
 
   if (!consultarAPI(apiURL, corpo, doc)) {
-    return RES_ERRO;
+    return (ultimoHTTP == 401) ? RES_SEM_ACESSO : RES_ERRO;
   }
 
   // Confere se o campo cadastrado existe e e booleano
@@ -255,8 +268,8 @@ int verificarCartaoNaAPI(String uid, float &saldo, float &tarifa) {
 // e o saldo, e desconta a passagem.
 //
 // Retorno: RES_LIBERADO, RES_BLOQUEADO, RES_SEM_SALDO,
-//          RES_CODIGO, RES_NAO_CADASTRADO (negado por outro motivo)
-//          ou RES_ERRO.
+//          RES_CODIGO, RES_NAO_CADASTRADO (negado por outro motivo),
+//          RES_SEM_ACESSO ou RES_ERRO.
 // ==========================
 
 int validarTokenNaAPI(String token, float &saldo, float &tarifa) {
@@ -276,7 +289,7 @@ int validarTokenNaAPI(String token, float &saldo, float &tarifa) {
   JsonDocument doc;
 
   if (!consultarAPI(apiURLNfc, corpo, doc)) {
-    return RES_ERRO;
+    return (ultimoHTTP == 401) ? RES_SEM_ACESSO : RES_ERRO;
   }
 
   if (!doc["cadastrado"].is<bool>()) {
@@ -304,10 +317,10 @@ int validarTokenNaAPI(String token, float &saldo, float &tarifa) {
 // ==========================
 // CELULAR: LEITURA POR NFC (ISO-DEP)
 //
-// O celular com o app BusPasse se comporta como um
+// O celular com o app QUICKPASS se comporta como um
 // cartao ISO 14443-4. O fluxo e:
 //   1. RATS  -> o celular responde com o ATS
-//   2. SELECT do AID do BusPasse (I-block)
+//   2. SELECT do AID do QUICKPASS (I-block)
 //   3. O celular responde "BP1:" + token + 90 00
 //   4. DESELECT
 //
@@ -439,7 +452,7 @@ bool lerTokenDoCelular(String &token) {
   byte respTam = sizeof(resp);
 
   if (!trocarAPDU(SELECT_BUSPASS, sizeof(SELECT_BUSPASS), resp, &respTam)) {
-    Serial.println("SELECT do BusPasse falhou.");
+    Serial.println("SELECT do QUICKPASS falhou.");
     deselecionar();
     return false;
   }
@@ -582,6 +595,22 @@ void mostrarResultado(int resultado, bool celular, float saldo, float tarifa) {
   }
 
   // ==========================
+  // CHAVE DO LEITOR RECUSADA (HTTP 401)
+  // ==========================
+
+  else if (resultado == RES_SEM_ACESSO) {
+
+    Serial.println("CHAVE DO LEITOR RECUSADA PELA API (HTTP 401)");
+    Serial.println("Confira LEITOR_KEY no segredos.h e LEITOR_API_KEY no Render.");
+
+    ledInvalido();
+
+    lcd.print("CHAVE RECUSADA");
+    lcd.setCursor(0, 1);
+    lcd.print("Veja segredos.h");
+  }
+
+  // ==========================
   // ERRO NA API OU CONEXAO
   // ==========================
 
@@ -623,6 +652,18 @@ void setup() {
   lcd.print("   QUICKPASS");
   lcd.setCursor(0, 1);
   lcd.print("Conectando WiFi");
+
+  // Avisa se o segredos.h ainda estiver com os valores de exemplo
+  if (strcmp(WIFI_SSID, "NOME_DO_WIFI") == 0 ||
+      strcmp(LEITOR_KEY, "CHAVE_DO_LEITOR") == 0) {
+    Serial.println("ATENCAO: preencha o segredos.h (Wi-Fi e chave do leitor) e grave de novo.");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Preencha o");
+    lcd.setCursor(0, 1);
+    lcd.print("segredos.h");
+    delay(3000);
+  }
 
   // Conecta ao Wi-Fi
   WiFi.mode(WIFI_STA);
@@ -691,11 +732,11 @@ void loop() {
   }
 
   // ==========================
-  // CELULAR COM O APP BUSPASSE
+  // CELULAR COM O APP QUICKPASS
   //
   // SAK com o bit 0x20 = ISO-DEP (14443-4). Celulares Android que
   // emulam cartao aparecem assim, com UID aleatorio (comeca com 08).
-  // Se nao for um celular do BusPasse e nao for UID aleatorio
+  // Se nao for um celular do QUICKPASS e nao for UID aleatorio
   // (ex.: outro cartao ISO-DEP), segue para o fluxo normal por UID.
   // ==========================
 
